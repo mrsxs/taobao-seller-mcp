@@ -9,8 +9,8 @@ import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { withBrowserLock } from '../lib/browser-lock.mjs';
-import { CooldownError, createCooldown, isVerifyMessage, optional } from '../lib/cooldown.mjs';
-import { QN_SITE, SYCM_SITE, createBrowserSession } from '../lib/browser.mjs';
+import { CooldownError, createCooldown, isBlockingError, isVerifyMessage, optional } from '../lib/cooldown.mjs';
+import { PageBlockedError, QN_SITE, SYCM_SITE, createBrowserSession } from '../lib/browser.mjs';
 import {
   attributeAnalysis, attributeItems, attributeList, categoryOverview, findMarketCategory, marketCategories, marketRank, marketSearchWords,
   priceBandItems, priceBands, priceSegments, RANK_BY as MARKET_RANK_BY, resolveAttributes, rivalShops, searchMarketCategories,
@@ -70,11 +70,12 @@ const cached = async (map, key, load) => {
   return value;
 };
 
-const isUserError = (err) => err instanceof QueryError || err instanceof CooldownError || err instanceof SycmError || err instanceof QnError || err instanceof ShopConfigError;
+const isUserError = (err) => err instanceof QueryError || err instanceof CooldownError || err instanceof SycmError || err instanceof QnError
+  || err instanceof PageBlockedError || err instanceof ShopConfigError;
 const PLATFORM = { tmall: '天猫', taobao: '淘宝' };
 
 const cooldown = createCooldown({ dir: DATA_DIR });
-const isVerifyError = (err) => (err instanceof SycmError || err instanceof QnError) && isVerifyMessage(err.message);
+const isVerifyError = (err) => (err instanceof SycmError || err instanceof QnError || err instanceof PageBlockedError) && isVerifyMessage(err.message);
 
 /** 在某家店的生意参谋标签页里执行：fn({ get, latest }) */
 function withSycm(shopRef, fn) {
@@ -85,7 +86,8 @@ function withSycm(shopRef, fn) {
     let cdp = null;
     try {
       cdp = await session.connect(shop.storeId);
-      const ctx = await cached(caches.sycm, cdp, () => sycmContext(cdp));
+      // 每次都从页面读 token（标签页可能刚被跳回工作页，旧 token 就失效了）；只是一次几毫秒的页面读取
+      const ctx = await sycmContext(cdp);
       const get = createSycmApi(cdp, ctx);
       const latest = (fresh = false) => {
         if (fresh) caches.latest.delete(shop.storeId);
@@ -93,7 +95,7 @@ function withSycm(shopRef, fn) {
       };
       // 只用来标天猫 / 淘宝；子账号可能没这个权限，取不到不影响其他数据
       const info = await cached(caches.info, shop.storeId, () => shopInfo(get)).catch((err) => {
-        if (isVerifyError(err)) throw err;
+        if (isBlockingError(err)) throw err;
         return null;
       });
       if (info?.platform) platformOf.set(shop.storeId, info.platform);
