@@ -59,3 +59,40 @@ test('失败：业务错误、非 JSON、页面 fetch 出错都抛 MtopError，�
   const expired = { reply: { status: 200, text: JSON.stringify({ ret: ['FAIL_SYS_TOKEN_EMPTY::令牌为空'] }) } };
   await assert.rejects(mtopFetch(fakeCdp([expired, { ...expired }]), { api: 'm.x', appKey: 'k' }), /TOKEN_EMPTY/);
 });
+
+test('页面请求超时：取消页面里同一个请求再抛错', async () => {
+  const { requestInPage, pageRequest, abortInPage } = await import('../lib/page-request.mjs');
+  const calls = [];
+  const cdp = {
+    callInPage: async (fn, arg) => {
+      calls.push({ fn, arg });
+      if (fn === pageRequest) throw new Error('Runtime.evaluate 超时 (100ms)');
+      return true;
+    },
+  };
+  await assert.rejects(requestInPage(cdp, { url: 'https://x.test/a' }, 100), /超时/);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].fn, abortInPage);
+  assert.equal(calls[1].arg, calls[0].arg.id);
+  assert.ok(calls[0].arg.id);
+  // 取消失败（比如连接已断）不掩盖原来的错误
+  const broken = { callInPage: async () => { throw new Error('原始错误'); } };
+  await assert.rejects(requestInPage(broken, { url: 'https://x.test/a' }), /原始错误/);
+});
+
+test('安全验证冷却：只认明确的安全验证；按店冷却，到时自动恢复', async () => {
+  const { createCooldown, CooldownError } = await import('../lib/cooldown.mjs');
+  let t = 0;
+  const cd = createCooldown({ ms: 10 * 60_000, now: () => t });
+  const a = { storeId: '1', name: '甲店' };
+  const b = { storeId: '2', name: '乙店' };
+  cd.note(a, new Error('千牛登录已失效或触发了安全验证'));
+  cd.check(a);
+  cd.note(a, new Error('触发了淘宝安全验证（滑块 / 验证码），请…'));
+  assert.throws(() => cd.check(a), (e) => e instanceof CooldownError && /10 分钟内/.test(e.message));
+  cd.check(b);
+  t = 9 * 60_000 + 1;
+  assert.throws(() => cd.check(a), /1 分钟内/);
+  t = 10 * 60_000;
+  cd.check(a);
+});

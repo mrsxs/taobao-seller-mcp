@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 淘宝 / 天猫卖家 MCP（stdio）：生意参谋经营数据、流量来源、商品排行、单品分析、引流搜索词、推广花费，以及千牛的订单和商品。
+// 淘宝 / 天猫卖家 MCP（stdio）：生意参谋经营数据、流量来源、商品排行、单品分析、引流搜索词、推广花费、市场和竞争数据，以及千牛的订单和商品。
 // 全部通过本机紫鸟店铺浏览器里已登录的页面取数（不走开放平台、不需要 AppKey），只读。
 // 每家店用两个工作标签页：生意参谋（sycm.taobao.com）和千牛（myseller.taobao.com，订单接口只允许它跨域）。
 // 协议：每行一条 JSON-RPC 2.0 消息；stdout 只写协议消息，诊断写 stderr。
@@ -9,10 +9,13 @@ import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { withBrowserLock } from '../lib/browser-lock.mjs';
+import { CooldownError, createCooldown, isVerifyMessage, optional } from '../lib/cooldown.mjs';
 import { QN_SITE, SYCM_SITE, createBrowserSession } from '../lib/browser.mjs';
 import {
-  categoryOverview, findMarketCategory, marketCategories, marketRank, marketSearchWords, priceSegments, rivalShops, searchMarketCategories,
+  attributeAnalysis, attributeItems, attributeList, categoryOverview, findMarketCategory, marketCategories, marketRank, marketSearchWords,
+  priceBandItems, priceBands, priceSegments, RANK_BY as MARKET_RANK_BY, resolveAttributes, rivalShops, searchMarketCategories,
 } from '../lib/market.mjs';
+import { lossItems, lossTargets, monitoredShops, pickRivals, publicShop, SHOP_METRICS, shopCompare } from '../lib/rival.mjs';
 import { createQnMtop, listOrders, listProducts, ORDER_TABS, orderCounts, PRODUCT_TABS, QnError } from '../lib/qn.mjs';
 import { ShopConfigError, parseShops, resolveShop } from '../lib/shops.mjs';
 import {
@@ -67,13 +70,17 @@ const cached = async (map, key, load) => {
   return value;
 };
 
-const isUserError = (err) => err instanceof QueryError || err instanceof SycmError || err instanceof QnError || err instanceof ShopConfigError;
+const isUserError = (err) => err instanceof QueryError || err instanceof CooldownError || err instanceof SycmError || err instanceof QnError || err instanceof ShopConfigError;
 const PLATFORM = { tmall: '天猫', taobao: '淘宝' };
+
+const cooldown = createCooldown({ dir: DATA_DIR });
+const isVerifyError = (err) => (err instanceof SycmError || err instanceof QnError) && isVerifyMessage(err.message);
 
 /** 在某家店的生意参谋标签页里执行：fn({ get, latest }) */
 function withSycm(shopRef, fn) {
   const shop = shopFor(shopRef);
   return exclusive(async () => {
+    cooldown.check(shop);
     const session = sessionFor(SYCM_SITE, shop.storeId);
     let cdp = null;
     try {
@@ -85,11 +92,15 @@ function withSycm(shopRef, fn) {
         return cached(caches.latest, shop.storeId, () => latestDate(get));
       };
       // 只用来标天猫 / 淘宝；子账号可能没这个权限，取不到不影响其他数据
-      const info = await cached(caches.info, shop.storeId, () => shopInfo(get)).catch(() => null);
+      const info = await cached(caches.info, shop.storeId, () => shopInfo(get)).catch((err) => {
+        if (isVerifyError(err)) throw err;
+        return null;
+      });
       if (info?.platform) platformOf.set(shop.storeId, info.platform);
-      const out = await fn({ get, latest, storeId: shop.storeId });
+      const out = await fn({ get, latest, storeId: shop.storeId, info });
       return { shop: shop.name, ...(info ? { platform: PLATFORM[info.platform] } : {}), ...out };
     } catch (err) {
+      if (isVerifyError(err)) cooldown.note(shop, err);
       if (cdp && !(err instanceof QueryError)) caches.sycm.delete(cdp);
       if (!isUserError(err)) session.reset();
       throw err;
@@ -101,12 +112,14 @@ function withSycm(shopRef, fn) {
 function withQn(shopRef, fn) {
   const shop = shopFor(shopRef);
   return exclusive(async () => {
+    cooldown.check(shop);
     const session = sessionFor(QN_SITE, shop.storeId);
     try {
       const cdp = await session.connect(shop.storeId);
       const out = await fn({ cdp, call: createQnMtop(cdp), platform: platformOf.get(shop.storeId), remember: (p) => platformOf.set(shop.storeId, p) });
       return { shop: shop.name, ...out };
     } catch (err) {
+      if (isVerifyError(err)) cooldown.note(shop, err);
       if (!isUserError(err)) session.reset();
       throw err;
     }
@@ -126,6 +139,22 @@ function precheck(a) {
   if (a.product_id !== undefined && !PRODUCT_ID.test(a.product_id)) throw new QueryError('product_id 应是淘宝 / 天猫商品 ID（数字）');
   if (a.category_id !== undefined && !/^\d{1,12}$/.test(a.category_id)) throw new QueryError('category_id 应是数字类目 ID（用 tb_market_categories 查）');
   if (a.price_segment !== undefined && !/^\d{1,3}$/.test(a.price_segment)) throw new QueryError('price_segment 应是价格段 ID（tb_market_overview 的 price_segments）');
+  if (a.price_band !== undefined && !/^\d{1,3}$/.test(a.price_band)) throw new QueryError('price_band 应是价格带 ID（不带 price_band 调一次 tb_market_prices 看有哪些）');
+  if (a.value_ids !== undefined) {
+    if (!/^\d{1,15}(,\d{1,15})?$/.test(a.value_ids)) throw new QueryError('value_ids 应是 tb_market_attributes 结果里的 value_ids（如 "123" 或 "123,456"）');
+    if (!a.attributes?.length) throw new QueryError('value_ids 要和得到它的 attributes 一起传');
+    if (a.value_ids.split(',').length !== a.attributes.length) throw new QueryError('value_ids 的个数要和 attributes 一样多（一个属性一个值）');
+  }
+  if (a.attributes !== undefined) {
+    const names = a.attributes.map((x) => x.trim());
+    if (names.some((x) => !x)) throw new QueryError('attributes 里不能有空属性名');
+    if (new Set(names).size !== names.length) throw new QueryError('attributes 里有重复的属性');
+  }
+  if (a.rivals !== undefined) {
+    if (a.rivals.some((r) => !r.trim())) throw new QueryError('rivals 里不能有空店名');
+    if (new Set(a.rivals.map((r) => r.trim())).size !== a.rivals.length) throw new QueryError('rivals 里有重复的店');
+  }
+  if (a.type === 'shops' && a.rank_by !== undefined && !MARKET_RANK_BY[a.rank_by]?.shops) throw new QueryError('店铺排行只支持 rank_by=pay_buyers / growth');
 }
 
 const RANGE_NOTE = '日期是北京时间自然日（生意参谋口径），最新通常到昨天；金额人民币。change 是较上一个同长度周期的变化比例。';
@@ -173,10 +202,9 @@ const words = (a) => withSycm(a.shop, async ({ get, latest }) => {
 });
 
 const orders = (a) => withQn(a.shop, async ({ cdp, call }) => {
-  const [list, counts] = await Promise.all([
-    listOrders(cdp, { tab: a.tab ?? 'latest3Months', page: a.page ?? 1 }),
-    orderCounts(call).catch((err) => ({ error: `计数没取到：${err.message}` })),
-  ]);
+  // 一个接一个发：前一个触发安全验证就不再发后面的
+  const list = await listOrders(cdp, { tab: a.tab ?? 'latest3Months', page: a.page ?? 1 });
+  const counts = await optional(orderCounts(call), (err) => ({ error: `计数没取到：${err.message}` }));
   return { tab: ORDER_TABS[a.tab ?? 'latest3Months'], ...list, counts,
     note: '千牛「已卖出的宝贝」，每页 15 单，下单时间是北京时间；paid 是实付金额（元）。不输出买家昵称和收货信息。counts 是待发货 / 即将超时 / 已超时计数。' };
 });
@@ -201,7 +229,8 @@ const mktCategories = (a) => withSycm(a.shop, async ({ get, storeId }) => ({
 const mktOverview = (a) => withSycm(a.shop, async ({ get, latest, storeId }) => {
   const range = await resolveRange(a, latest);
   const cat = await categoryFor(get, storeId, a.category_id);
-  const [overview, segments] = await Promise.all([categoryOverview(get, range, cat), priceSegments(get, range, cat)]);
+  const overview = await categoryOverview(get, range, cat);
+  const segments = await priceSegments(get, range, cat);
   return { ...rangeOut(range), category: { id: cat.id, path: cat.path }, overview, price_segments: segments,
     note: `${MARKET_NOTE}overview：支付买家数、支付金额占父类目比例、支付金额增幅、供需比；price_segments 的 id 可用于 tb_market_rank。` };
 });
@@ -209,9 +238,50 @@ const mktOverview = (a) => withSycm(a.shop, async ({ get, latest, storeId }) => 
 const mktRank = (a) => withSycm(a.shop, async ({ get, latest, storeId }) => {
   const range = await resolveRange(a, latest);
   const cat = await categoryFor(get, storeId, a.category_id);
-  const out = await marketRank(get, range, cat, { type: a.type ?? 'items', priceSegment: a.price_segment ?? '', page: a.page ?? 1, pageSize: a.page_size ?? 20 });
+  const out = await marketRank(get, range, cat, {
+    type: a.type ?? 'items', rankBy: a.rank_by ?? 'pay_buyers', priceSegment: a.price_segment ?? '', page: a.page ?? 1, pageSize: a.page_size ?? 20,
+  });
   return { ...rangeOut(range), category: { id: cat.id, path: cat.path }, type: a.type ?? 'items', ...out,
-    note: `${MARKET_NOTE}按交易排名；rank_change 是排名较上期变化；is_mine 标出本店。` };
+    note: `${MARKET_NOTE}rank_change 是排名较上期变化；is_mine 标出本店。流量榜多给 search_visitors（搜索访客），加购收藏榜多给 add_to_cart_buyers / collect_buyers。` };
+});
+
+const mktPrices = (a) => withSycm(a.shop, async ({ get, latest, storeId }) => {
+  const range = await resolveRange(a, latest);
+  const cat = await categoryFor(get, storeId, a.category_id);
+  const bands = await priceBands(get, range, cat);
+  const out = { ...rangeOut(range), category: { id: cat.id, path: cat.path }, price_bands: bands };
+  if (a.price_band !== undefined) {
+    const items = await priceBandItems(get, range, cat, a.price_band);
+    out.price_band = bands.find((b) => b.id === a.price_band)?.range ?? a.price_band;
+    out.items = items.slice(0, a.limit ?? 20);
+  }
+  out.note = `${MARKET_NOTE}price_bands 是「类目洞察 → 价格分析」的价格带（和 tb_market_overview 的 price_segments 分法不同，不能混用），`
+    + 'quadrant 是生意参谋按增长和成交给的建议；不在任何象限的价格带不会列出，但仍可用 ID 查商品。'
+    + 'items 是这个价格带里支付单量最高的商品：pay_orders 支付单量（区间），unit_price 件单价 = 支付金额 ÷ 支付件数，是成交均价（含优惠、多个 SKU 平均），不是标价。';
+  return out;
+});
+
+const mktAttributes = (a) => withSycm(a.shop, async ({ get, latest, storeId }) => {
+  const cat = await categoryFor(get, storeId, a.category_id);
+  const list = await attributeList(get, cat);
+  const base = { category: { id: cat.id, path: cat.path } };
+  if (!a.attributes?.length) {
+    return { ...base, attributes: list, note: '这个类目可分析的属性；把 1~2 个属性名放进 attributes 再调一次，看各取值（组合）的成交。' };
+  }
+  const props = resolveAttributes(list, a.attributes);
+  const range = await resolveRange(a, latest);
+  const ids = props.map((p) => p.id);
+  const out = { ...base, ...rangeOut(range), attributes: props.map((p) => p.name) };
+  if (a.value_ids) {
+    out.value_ids = a.value_ids;
+    out.items = (await attributeItems(get, range, cat, ids, a.value_ids)).slice(0, a.limit ?? 20);
+    out.note = `${MARKET_NOTE}这个属性取值下支付单量最高的商品；pay_orders 支付单量（区间），unit_price 件单价（成交均价，这里是取整后的档位，如「30+」）。`;
+  } else {
+    Object.assign(out, await attributeAnalysis(get, range, cat, ids, { page: a.page ?? 1, pageSize: a.page_size ?? 20 }));
+    out.note = `${MARKET_NOTE}每行是一个属性取值（两个属性时是组合，如「品牌+尺码」），按支付买家数排：pay_amount_share 支付金额占比、pay_amount_growth 支付金额增速（区间），`
+      + 'active_items_growth 动销商品数增速。要看某个取值下卖得好的商品和件单价，把它的 value_ids 连同同样的 attributes 再传一次。';
+  }
+  return out;
 });
 
 const mktWords = (a) => withSycm(a.shop, async ({ get, latest, storeId }) => {
@@ -228,6 +298,38 @@ const competitors = (a) => withSycm(a.shop, async ({ get, latest }) => {
     note: '生意参谋「竞争 → 竞店监控」里设置的竞店（要先在生意参谋里添加监控）；指标是区间。news 是竞店动态。' };
 });
 
+const competitorShop = (a) => withSycm(a.shop, async ({ get, latest }) => {
+  const list = await monitoredShops(get);
+  if (!a.rivals?.length) {
+    return { monitored: list.map(publicShop),
+      note: '生意参谋里设置监控的竞店。把 1~2 个店名放进 rivals 再调一次做对比；要对比别的店，先在生意参谋「竞争 → 竞店监控」里添加。' };
+  }
+  const rivals = pickRivals(list, a.rivals);
+  if (new Set(rivals.map((r) => r.name)).size !== rivals.length) throw new QueryError('rivals 指向了同一家店');
+  const range = await resolveRange(a, latest);
+  const out = await shopCompare(get, range, rivals, { metric: a.metric ?? 'visitors', topBy: a.top_by ?? 'pay_buyers', topLimit: a.limit ?? 10 });
+  return { ...rangeOut(range), ...out,
+    note: '本店（mine）是精确值，竞店是区间；trend 是以 date 为最后一天的近 30 天每日。rivals[].top_items 是竞店热门商品，change 是较上期变化；news 是竞店动态（上新、报名活动等）。' };
+});
+
+const competitorLoss = (a) => withSycm(a.shop, async ({ get, latest, storeId, info }) => {
+  const range = await resolveRange(a, latest);
+  let cateId = info?.main_category_id ?? null;
+  let category = info?.main_category ?? null;
+  if (a.category_id !== undefined) {
+    const cat = await categoryFor(get, storeId, a.category_id);
+    cateId = cat.id;
+    category = cat.path;
+  }
+  if (!cateId) throw new SycmError('没取到这家店的主营类目，请用 category_id 指定（tb_market_categories 查）');
+  const items = await lossItems(get, range, cateId, { page: a.page ?? 1, pageSize: a.page_size ?? 20 });
+  const targets = await optional(lossTargets(get, range.end), (err) => ({ error: `流失去向没取到：${err.message}` }));
+  return { ...rangeOut(range), category, ...items, lost_to: { date: range.end, ...targets },
+    note: 'items：本店商品的买家流失到竞品的情况（精确值），按流失金额排：lost_pay_amount 流失金额（元）、lost_buyers 流失人数、loss_rate 流失率、'
+      + 'lost_collect_buyers / lost_cart_buyers 收藏 / 加购后流失的人数、lost_to_items / lost_to_shops 流失去了多少个竞品 / 竞店。'
+      + 'lost_to：date 这一天本店访客流失最多的竞品和竞店（主营类目，lost_index 是流失指数，只比较相对大小）。' };
+});
+
 const shops = () => {
   if (configError) throw configError;
   return {
@@ -241,7 +343,9 @@ const INSTRUCTIONS = '淘宝 / 天猫卖家数据（通过本机紫鸟店铺浏�
   + '经营：tb_store_overview（支付金额、访客、转化、客单价、下单、推广花费，单日 / 近 7 / 30 天，带环比；单日附退款、复购和同行对比）、tb_store_trend（近 30 天每日）、tb_store_today（今天实时）。'
   + '流量：tb_traffic_sources（全店或单品来源）、tb_search_words（引流搜索词）。商品：tb_product_rank（商品排行）、tb_product_analysis（单品核心指标 / 每日 / SKU / 来源）。'
   + '千牛：tb_orders（已卖出的宝贝，按标签筛选翻页）、tb_products（出售中 / 仓库中的宝贝）。'
-  + '市场（免费版，区间值）：tb_market_categories 查类目 → tb_market_overview（类目大盘、价格段）、tb_market_rank（类目商品 / 店铺排行）、tb_market_search_words（热搜 / 飙升词）；tb_competitors（竞店监控）。'
+  + '市场（免费版，区间值）：tb_market_categories 查类目 → tb_market_overview（类目大盘、价格段）、tb_market_rank（类目商品 / 店铺排行：交易、增速、流量、加购收藏、新品）、'
+  + 'tb_market_prices（价格带和各价格带热销商品的件单价）、tb_market_attributes（属性取值成交和热销商品）、tb_market_search_words（热搜 / 飙升词）。'
+  + '竞争：tb_competitors（竞店监控列表）、tb_competitor_shop（本店 vs 监控竞店）、tb_competitor_loss（本店商品的买家流失到哪些竞品）。'
   + '多店铺：tb_shops 列出已配置的店，其他工具用 shop 参数选店，比较多家店时逐店调用。日期是北京时间，最新通常到昨天。';
 
 // ---- 工具定义 ----
@@ -328,15 +432,44 @@ const TOOLS = [
   },
   {
     name: 'tb_market_rank',
-    description: '市场：类目里按交易排名的商品或店铺（排名、排名变化、商品 / 店铺名、是否天猫、支付买家数、访客数、核心词、是否本店）；可按价格段筛选。数值是区间。',
+    description: '市场：类目商品或店铺排行（排名、排名变化、商品 / 店铺名、是否天猫、支付买家数、访客数、核心词、是否本店）。榜单可选交易总量、交易增速、流量总量（多给搜索访客）、'
+      + '加购收藏（多给加购 / 收藏人数）、新品流量；可按价格段筛选。数值是区间。',
     annotations: RO,
     inputSchema: obj({
       shop: shopArg, category_id: categoryArg, period: periodArg, date: dateArg,
       type: { type: 'string', enum: ['items', 'shops'], default: 'items', description: 'items 商品排行 / shops 店铺排行' },
+      rank_by: { type: 'string', enum: Object.keys(MARKET_RANK_BY), default: 'pay_buyers',
+        description: `${Object.entries(MARKET_RANK_BY).map(([k, v]) => `${k} ${v.label}`).join(' / ')}；店铺排行只有 pay_buyers / growth` },
       price_segment: { type: 'string', description: '价格段 ID（tb_market_overview 的 price_segments）；只对商品排行有效' },
       page: pageArg, page_size: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
     }, ['category_id']),
     run: mktRank,
+  },
+  {
+    name: 'tb_market_prices',
+    description: '市场：类目价格带（类目洞察 → 价格分析）——各价格带的支付买家数和生意参谋的建议；传 price_band 再给这个价格带里卖得最好的商品：支付单量（区间）、'
+      + '件单价（支付金额 ÷ 支付件数，即成交均价）、支付金额（区间）。用来看同类商品实际成交在什么价位。',
+    annotations: RO,
+    inputSchema: obj({
+      shop: shopArg, category_id: categoryArg, period: periodArg, date: dateArg,
+      price_band: { type: 'string', description: '价格带 ID（先不传调一次，看 price_bands）' },
+      limit: { type: 'integer', minimum: 1, maximum: 50, default: 20, description: '最多返回几个商品' },
+    }, ['category_id']),
+    run: mktPrices,
+  },
+  {
+    name: 'tb_market_attributes',
+    description: '市场：类目属性分析（类目洞察 → 属性分析）——不传 attributes 列出可分析的属性（品牌、尺码、颜色分类…）；传 1~2 个属性看各取值（组合）的支付买家数、'
+      + '支付金额占比和增速、动销商品增速；再传 value_ids 看这个取值下卖得最好的商品和件单价。数值是区间。',
+    annotations: RO,
+    inputSchema: obj({
+      shop: shopArg, category_id: categoryArg, period: periodArg, date: dateArg,
+      attributes: { type: 'array', items: { type: 'string' }, maxItems: 2, description: '属性名或属性 ID，最多 2 个，如 ["品牌","尺码"]' },
+      value_ids: { type: 'string', description: '属性取值 ID（属性分析结果里的 value_ids），要和同样的 attributes 一起传' },
+      page: pageArg, page_size: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
+      limit: { type: 'integer', minimum: 1, maximum: 50, default: 20, description: '传 value_ids 时最多返回几个商品' },
+    }, ['category_id']),
+    run: mktAttributes,
   },
   {
     name: 'tb_market_search_words',
@@ -357,6 +490,33 @@ const TOOLS = [
     annotations: RO,
     inputSchema: obj({ shop: shopArg, period: periodArg, date: dateArg, page: pageArg, page_size: { type: 'integer', minimum: 1, maximum: 50, default: 20 } }),
     run: competitors,
+  },
+  {
+    name: 'tb_competitor_shop',
+    description: '竞店对比：本店 vs 1~2 家生意参谋里的监控竞店——访客、支付买家、转化率、加购、收藏（本店精确值，竞店区间），某个指标的近 30 天每日走势，'
+      + '各竞店的热门商品（按支付买家或访客）和动态。不传 rivals 时列出可选的监控竞店。',
+    annotations: RO,
+    inputSchema: obj({
+      shop: shopArg, period: periodArg, date: dateArg,
+      rivals: { type: 'array', items: { type: 'string' }, maxItems: 2, description: '监控竞店的店名（1~2 个，可写店名里的一段）' },
+      metric: { type: 'string', enum: Object.keys(SHOP_METRICS), default: 'visitors',
+        description: `走势看哪个指标：${Object.entries(SHOP_METRICS).map(([k, v]) => `${k} ${v.label}`).join(' / ')}` },
+      top_by: { type: 'string', enum: ['pay_buyers', 'visitors'], default: 'pay_buyers', description: '竞店热门商品按支付买家 / 访客排' },
+      limit: { type: 'integer', minimum: 1, maximum: 20, default: 10, description: '每家竞店最多几个热门商品' },
+    }),
+    run: competitorShop,
+  },
+  {
+    name: 'tb_competitor_loss',
+    description: '竞品流失：本店哪些商品的买家流失到了竞品（流失金额、流失人数、流失率、收藏 / 加购后流失人数、流失去了多少竞品和竞店，精确值），'
+      + '以及最近一天本店访客流失最多的 5 个竞品和 5 家竞店（流失指数）。',
+    annotations: RO,
+    inputSchema: obj({
+      shop: shopArg, period: periodArg, date: dateArg,
+      category_id: { type: 'string', description: '只看这个类目的商品（tb_market_categories 查）；不填 = 店铺主营一级类目' },
+      page: pageArg, page_size: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
+    }),
+    run: competitorLoss,
   },
   {
     name: 'tb_orders',

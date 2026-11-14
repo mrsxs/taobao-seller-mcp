@@ -3,13 +3,17 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { categoryOverview, findMarketCategory, marketRank, parseMarketCategories, parseMarketItem, parseMarketShop, parseMarketWord, parseRivalShop, searchMarketCategories } from '../lib/market.mjs';
-import { pageRequest } from '../lib/page-request.mjs';
+import {
+  attributeAnalysis, attributeItems, categoryOverview, findMarketCategory, marketRank, parseAttributeValue, parseHotItem, parseMarketCategories, parseMarketItem,
+  parseMarketShop, parseMarketWord, parsePriceBands, parseRivalShop, priceBandItems, resolveAttributes, searchMarketCategories,
+} from '../lib/market.mjs';
+import { lossItems, parseCoreIndexes, parseCoreTrend, parseLossItem, parseLossTargets, parseRivalTopItem, pickRivals, publicShop, shopCompare } from '../lib/rival.mjs';
+import { pageRequest, abortInPage } from '../lib/page-request.mjs';
 import { buildSoldForm, createQnMtop, listProducts, parseOrder, parseProductTable, parseSold, QnError } from '../lib/qn.mjs';
 import { MtopError } from '../lib/mtop-fetch.mjs';
 import { parseShops, resolveShop, ShopConfigError } from '../lib/shops.mjs';
 import {
-  createSycmApi, explainHtml, parseItemTrend, parseRankRow, parseSourceRow, parseTrend, parseWord, periodRange, pickMetrics, pickPeers, resolveRange, SycmError,
+  createSycmApi, explainHtml, isRiskBlock, parseItemTrend, parseRankRow, parseSourceRow, parseTrend, parseWord, periodRange, pickMetrics, pickPeers, resolveRange, SycmError,
 } from '../lib/sycm.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -188,6 +192,120 @@ test('市场：类目路径、商品 / 店铺 / 搜索词 / 竞店解析（区�
   assert.deepEqual([seen[0][1].cateId, seen[0][1].cateFlag, seen[0][1].marketVersion, seen[0][1].dateRange], [3000, 0, 'free', '2026-11-07|2026-11-13']);
 });
 
+test('市场：榜单类型走对接口；价格带、热销商品件单价、属性分析', async () => {
+  const cat = { id: 3000, cate_flag: 0 };
+  const range = { period: 'recent7', start: '2026-11-07', end: '2026-11-13' };
+  const seen = [];
+  const get = async (path, params) => { seen.push([path, params]); return { recordCount: 2, data: [] }; };
+  await marketRank(get, range, cat, { rankBy: 'visitors' });
+  await marketRank(get, range, cat, { rankBy: 'add_to_cart' });
+  await marketRank(get, range, cat, { rankBy: 'growth', type: 'shops' });
+  assert.deepEqual(seen.map(([p, q]) => [p, q.rankType]), [
+    ['/mc/mq/mkt/item/offline/rank/search.json', 'flow'], ['/mc/mq/mkt/item/offline/rank/purpose.json', 'add'], ['/mc/mq/mkt/shop/offline/rank.json', 'growth']]);
+  await assert.rejects(marketRank(get, range, cat, { rankBy: 'new_items', type: 'shops' }), /店铺排行只支持/);
+  // 新品榜没数据时接口给空数组而不是 { data }
+  assert.deepEqual(await marketRank(async () => [], range, cat, { rankBy: 'new_items' }), { rank_by: '新品流量', total: 0, items: [] });
+
+  const flow = parseMarketItem({ itemId: { value: '100000000005' }, uv: { value: '1万 ~ 2.5万' }, searchUv: { value: '10 ~ 50' }, cartByrCnt: { value: '100 ~ 250' },
+    item: { itemId: '100000000005', title: '流量品', userId: 12345 }, shop: { title: '某店', userId: 12345 }, sellerId: 12345, cateRankId: { value: 1 } });
+  assert.deepEqual([flow.search_visitors, flow.add_to_cart_buyers, flow.collect_buyers, flow.pay_buyers], ['10 ~ 50', '100 ~ 250', undefined, null]);
+  assert.equal(JSON.stringify(flow).includes('12345'), false);
+
+  const bands = parsePriceBands({
+    HgLp: [{ priceRangeId: { value: '4' }, priceRangeName: { value: '660.0-3200.0' }, payByrCnt: { value: '750 ~ 1000' } }],
+    LgHp: [{ priceRangeId: { value: '1' }, priceRangeName: { value: '0-70.0' }, payByrCnt: { value: '10万 ~ 25万' } }, { priceRangeName: { value: '无 ID' } }],
+  });
+  assert.deepEqual(bands.map((b) => [b.id, b.range, b.pay_buyers]), [['1', '0-70.0', '10万 ~ 25万'], ['4', '660.0-3200.0', '750 ~ 1000']]);
+  assert.match(bands[0].quadrant, /增长慢、成交多/);
+
+  const hot = parseHotItem({ itemId: { value: '100000000006' }, item: { itemId: '100000000006', isMallItem: true, title: '热销品' },
+    payMentVolume: { value: '2500 ~ 5000' }, perItemAmt: { value: 8.71984 }, payAmt: { value: '4万 ~ 6万' } });
+  assert.deepEqual(hot, { product_id: '100000000006', title: '热销品', url: 'https://detail.tmall.com/item.htm?id=100000000006', tmall: true,
+    pay_orders: '2500 ~ 5000', unit_price: 8.72, pay_amount: '4万 ~ 6万' });
+  // 属性热销商品：没有 isMallItem，从跳转链接认天猫；件单价是「30+」这样的档位
+  const hot2 = parseHotItem({ itemId: { value: '100000000007' }, item: { itemId: '100000000007', title: 'x', detailUrl: '//sycm.taobao.com/mc/common/tm_item_redirect.htm?mi_id=T' },
+    payMentVolume: { value: '10 ~ 50' }, perItemAmt: { value: '30+' } });
+  assert.deepEqual([hot2.tmall, hot2.unit_price, 'pay_amount' in hot2, hot2.url.includes('mi_id')], [true, '30+', false, false]);
+
+  seen.length = 0;
+  const list = async (path, params) => { seen.push([path, params]); return Array.from({ length: 50 }, (_, i) => ({ itemId: { value: String(100000000100 + i) } })); };
+  assert.equal((await priceBandItems(list, range, cat, '2')).length, 50);
+  assert.deepEqual([seen[0][0], seen[0][1].priceRangeId, seen[0][1].indexCode], ['/mc/mq/mkt/cate/insights/priceseg/item/hotsale.json', '2', 'payMentVolume,perItemAmt']);
+
+  const props = [{ id: '20000', name: '品牌' }, { id: '20509', name: '尺码' }];
+  assert.deepEqual(resolveAttributes(props, ['尺码', '20000']).map((p) => p.id), ['20509', '20000']);
+  assert.throws(() => resolveAttributes(props, ['颜色']), /没有属性「颜色」；可选：品牌、尺码/);
+  assert.deepEqual(parseAttributeValue({ valueName: { value: '甲+标准' }, valueIds: { value: '11,22' }, payByrCnt: { value: '100 ~ 250' },
+    payOrdAmtRate: { value: '0% ~ 10%' }, payAmtGrowRate: { value: '40% ~ 50%' }, dynamicPctSaleRate: { value: 0.441176 } }),
+  { value: '甲+标准', value_ids: '11,22', pay_buyers: '100 ~ 250', pay_amount_share: '0% ~ 10%', pay_amount_growth: '40% ~ 50%', active_items_growth: 0.4412 });
+  seen.length = 0;
+  await attributeAnalysis(get, range, cat, ['20000', '20509'], { page: 2, pageSize: 10 });
+  await attributeItems(async (p, q) => { seen.push([p, q]); return []; }, range, cat, ['20000', '20509'], '11,22');
+  assert.deepEqual(seen.map(([p, q]) => [p, q.propIds, q.valueIds, q.page]), [
+    ['/mc/mq/cate/insights/prop/detail.json', '20000,20509', undefined, 2], ['/mc/mq/cate/insights/prop/hotitem/security.json', '20000,20509', '11,22', 1]]);
+});
+
+test('竞争：竞店按名字选、对比数据（本店精确 / 竞店区间）、不输出加密 userId；竞品流失', async () => {
+  const list = [
+    { name: '甲模型', tmall: false, url: 'https://a.taobao.com', userId: 'ENC_A' },
+    { name: '乙模玩旗舰店', tmall: true, url: 'https://b.tmall.com', userId: 'ENC_B' },
+    { name: '乙模玩专卖店', tmall: true, url: 'https://c.tmall.com', userId: 'ENC_C' },
+  ];
+  assert.deepEqual(pickRivals(list, ['甲', '乙模玩旗舰店']).map((r) => r.userId), ['ENC_A', 'ENC_B']);
+  assert.throws(() => pickRivals(list, ['乙模玩']), /匹配到多家竞店/);
+  assert.throws(() => pickRivals(list, ['丙']), /不在生意参谋的监控竞店里.*可选：甲模型、乙模玩旗舰店、乙模玩专卖店/);
+  assert.equal('userId' in publicShop(list[0]), false);
+
+  const rivals = [list[0]];
+  assert.deepEqual(parseCoreIndexes({ selfShop: { uv: { value: 5377 }, payRate: { value: 0.0517016 } }, rivalShop1: { uv: { value: '1万 ~ 2.5万' }, payRate: { value: '1% ~ 2.5%' } } }, rivals), {
+    mine: { visitors: 5377, pay_buyers: null, pay_rate: 0.0517, add_to_cart: null, collect: null },
+    rivals: [{ shop: '甲模型', visitors: '1万 ~ 2.5万', pay_buyers: null, pay_rate: '1% ~ 2.5%', add_to_cart: null, collect: null }],
+  });
+  // 本店的走势是数组，竞店的是 { drawValue, value: [] }；日期是北京时间 0 点
+  const day0 = Date.UTC(2026, 10, 12) - 8 * 3600_000;
+  assert.deepEqual(parseCoreTrend({ selfShop: { statDate: [day0, day0 + 86400_000], uv: [691, 731] }, rivalShop1: { statDate: [day0, day0 + 86400_000], uv: { drawValue: [1000, 1000], value: ['1000 ~ 2500', '1000 ~ 2500'] } } }, 'uv', rivals),
+    [{ date: '2026-11-12', mine: 691, 甲模型: '1000 ~ 2500' }, { date: '2026-11-13', mine: 731, 甲模型: '1000 ~ 2500' }]);
+  assert.deepEqual(parseRivalTopItem({ itemId: { value: 100000000008 }, item: { itemId: 100000000008, title: '竞店热卖', detailUrl: '//sycm.taobao.com/mc/common/tb_item_redirect.htm?mi_id=T' },
+    payByrCnt: { cycleCrc: '40%', value: '10 ~ 50' } }), { product_id: '100000000008', title: '竞店热卖', url: 'https://item.taobao.com/item.htm?id=100000000008', pay_buyers: '10 ~ 50', change: '40%' });
+
+  const range = { period: 'recent7', start: '2026-11-07', end: '2026-11-13' };
+  const seen = [];
+  const get = async (path, params) => {
+    seen.push([path, params]);
+    if (path.includes('summary')) throw new Error('动态挂了');
+    if (path.includes('getTopItems')) return [{ itemId: { value: 1 }, uv: { value: '1 ~ 2' } }, { itemId: { value: 2 }, uv: { value: '1 ~ 2' } }];
+    return {};
+  };
+  const out = await shopCompare(get, range, rivals, { metric: 'pay_rate', topBy: 'visitors', topLimit: 1 });
+  assert.equal(out.trend.metric, '支付转化率');
+  assert.deepEqual([out.rivals[0].news, out.rivals[0].top_items.length, out.rivals[0].top_items[0].visitors], [null, 1, '1 ~ 2']);
+  const trendCall = seen.find(([p]) => p.includes('getCoreTrend'))[1];
+  assert.deepEqual([trendCall.indexCode, trendCall.rivalUser1Id, trendCall.rivalUser2Id], ['payRate', 'ENC_A', '']);
+  assert.equal(seen.find(([p]) => p.includes('getTopItems'))[1].topType, 'uv');
+  assert.equal(JSON.stringify(out).includes('ENC_A'), false);
+  await assert.rejects(shopCompare(get, range, rivals, { metric: 'gmv' }), /metric 只能是/);
+
+  assert.deepEqual(parseLossItem({ itemId: { value: '100000000009' }, item: { itemId: '100000000009', title: '本店商品' }, payLostAmt: { value: 5209.5037 },
+    losByrCnt: { value: 76 }, losRate: { value: 0.1080196 }, cltLosByrCnt: { value: 2 }, cartLosByrCnt: { value: 9 }, losItmCnt: { value: 202 }, losShopCnt: { value: 58 } }), {
+    product_id: '100000000009', title: '本店商品', lost_pay_amount: 5209.5, lost_buyers: 76, loss_rate: 0.108, lost_collect_buyers: 2, lost_cart_buyers: 9, lost_to_items: 202, lost_to_shops: 58,
+  });
+  const targets = parseLossTargets({ mainCateName: '一级', top5ItemResult: [{ itemId: 100000000010, item: { itemId: 100000000010, title: '竞品', userId: 'ENC_X' }, lostIndex: 436.2234, lostHits: 36.9 }],
+    top5ShopResult: [{ shop: { title: '竞店', b2CShop: true, shopUrl: '//x.tmall.com', userId: 'ENC_X' }, sellerId: 'ENC_X', lostIndex: 470.03 }] });
+  assert.deepEqual(targets, { main_category: '一级', items: [{ product_id: '100000000010', title: '竞品', url: 'https://item.taobao.com/item.htm?id=100000000010', lost_index: 436.2 }],
+    shops: [{ shop: '竞店', tmall: true, shop_url: 'https://x.tmall.com', lost_index: 470 }] });
+  assert.equal(JSON.stringify(targets).includes('ENC_X'), false);
+  seen.length = 0;
+  assert.deepEqual(await lossItems(async (p, q) => { seen.push([p, q]); return { recordCount: 0, data: [] }; }, range, 1000), { total: 0, items: [] });
+  assert.deepEqual([seen[0][0], seen[0][1].cateId, seen[0][1].orderBy], ['/mc/free/ci/item/view/drain/recognition.json', 1000, 'payLostAmt']);
+});
+
+test('生意参谋 JSON 形式的风控拦截 → 安全验证（不当成普通失败）', async () => {
+  const blocked = JSON.stringify({ ret: ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试'], data: { url: 'https://sycm.taobao.com:443//mc/x.json/_____tmd_____/punish?x5secdata=abc' } });
+  const get = createSycmApi({}, { token: 't' }, async () => ({ status: 200, text: blocked }));
+  await assert.rejects(get('/mc/x.json'), (e) => e instanceof SycmError && /安全验证/.test(e.message));
+  assert.equal(isRiskBlock({ code: 0, data: { url: 'https://shop.taobao.com' } }), false);
+});
+
 test('HTML 返回的分辨：验证码 / 登录页 / 其他', () => {
   assert.match(explainHtml({ text: '<html>punish</html>' }, 'x'), /安全验证/);
   assert.match(explainHtml({ url: 'https://login.taobao.com/a', text: '' }, 'x'), /登录已失效/);
@@ -198,7 +316,9 @@ test('页面请求函数自包含（会被序列化到页面里执行）', () =>
   const src = pageRequest.toString();
   assert.match(src, /referrer: location\.href/);
   assert.match(src, /redirect: 'manual'/);
+  assert.match(src, /signal: ctrl\.signal/);
   assert.doesNotMatch(src, /setTimeout|import\(/);
+  assert.doesNotMatch(abortInPage.toString(), /setTimeout|import\(/);
 });
 
 test('MCP：握手、工具列表、参数错误在连浏览器之前返回', async () => {
@@ -227,8 +347,8 @@ test('MCP：握手、工具列表、参数错误在连浏览器之前返回', as
     assert.equal(init.result.serverInfo.name, 'taobao-seller-mcp');
     const tools = (await rpc('tools/list', {})).result.tools;
     assert.deepEqual(tools.map((t) => t.name), ['tb_shops', 'tb_store_overview', 'tb_store_trend', 'tb_store_today', 'tb_traffic_sources', 'tb_product_rank',
-      'tb_product_analysis', 'tb_search_words', 'tb_market_categories', 'tb_market_overview', 'tb_market_rank', 'tb_market_search_words', 'tb_competitors',
-      'tb_orders', 'tb_products']);
+      'tb_product_analysis', 'tb_search_words', 'tb_market_categories', 'tb_market_overview', 'tb_market_rank', 'tb_market_prices', 'tb_market_attributes',
+      'tb_market_search_words', 'tb_competitors', 'tb_competitor_shop', 'tb_competitor_loss', 'tb_orders', 'tb_products']);
     assert.ok(tools.every((t) => t.annotations.readOnlyHint === true));
     assert.deepEqual(JSON.parse(await text('tb_shops', {})).shops, [{ name: '测试店', store_id: '12345678901234', default: true }]);
     assert.match(await text('tb_store_overview', { shop: '别的店' }), /没有找到店铺「别的店」/);
@@ -242,6 +362,14 @@ test('MCP：握手、工具列表、参数错误在连浏览器之前返回', as
     assert.match(await text('tb_market_rank', { category_id: '1', price_segment: 'x' }), /price_segment 应是/);
     assert.match(await text('tb_product_analysis', { product_id: '100000000002', sections: ['overview', 'trend', 'skus', 'sources', 'overview'] }), /最多 4 项/);
     assert.match(await text('tb_shops', { constructor: 1 }), /未知参数：constructor/);
+    assert.match(await text('tb_market_rank', { category_id: '1', rank_by: 'nope' }), /rank_by 只能是/);
+    assert.match(await text('tb_market_rank', { category_id: '1', type: 'shops', rank_by: 'visitors' }), /店铺排行只支持/);
+    assert.match(await text('tb_market_prices', { category_id: '1', price_band: '1;x' }), /price_band 应是/);
+    assert.match(await text('tb_market_attributes', { category_id: '1', value_ids: '12' }), /要和得到它的 attributes 一起传/);
+    assert.match(await text('tb_market_attributes', { category_id: '1', attributes: ['品牌'], value_ids: '1,2' }), /个数要和 attributes 一样多/);
+    assert.match(await text('tb_market_attributes', { category_id: '1', attributes: ['a', 'b', 'c'] }), /最多 2 项/);
+    assert.match(await text('tb_competitor_shop', { rivals: ['甲', '甲'] }), /重复/);
+    assert.match(await text('tb_competitor_shop', { metric: 'gmv' }), /metric 只能是/);
     const unknown = await rpc('nope/method', {});
     assert.equal(unknown.error.code, -32601);
   } finally {
