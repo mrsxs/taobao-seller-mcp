@@ -16,7 +16,7 @@
 1. 本机装了紫鸟客户端和 `ziniao-cli`（`ziniao-cli store list` 能列出店铺）。用客户端自带的 Node 启动 MCP 时（如 Accio），会自动去 nvm / Homebrew / npm 全局目录找 `ziniao-cli`，找不到可用 `ZINIAO_CLI` 指定。
 2. 店铺浏览器里登录了这家店的千牛（myseller.taobao.com），生意参谋能正常打开。
 3. 店铺浏览器没开时工具会通过 `ziniao-cli` 自动打开（会弹出一次窗口）。每家店会用两个标签页：生意参谋、千牛（订单接口只允许千牛页面跨域调用）。
-4. **紫鸟新版（2026-11 起）**：店铺浏览器的调试端口要令牌，直连连不上时会自动改走 `ziniao-cli page exec`（紫鸟 Bridge）在标签页里执行；紫鸟 Bridge 不允许脚本读 cookie，所以这时千牛的 mtop 请求交给页面自带的 SDK 签名。这种模式下新开工作标签页时紫鸟窗口不会自动最小化，每次查询约多 0.5–1 秒。
+4. **紫鸟新版（2026-11 起）**：店铺浏览器的调试端口要令牌，直连连不上时会自动改走 `ziniao-cli page exec`（紫鸟 Bridge）在标签页里执行；紫鸟 Bridge 不允许脚本读 cookie，所以这时千牛的 mtop 请求交给页面自带的 SDK 签名。非 Windows 上用 Bridge 的 `execute_script`（awaitPromise）一次拿结果，Windows 上脚本 base64 编码后经 `page exec` 轮询；工作标签页记在数据目录的 `worker-tabs.json`，新进程直接复用。这种模式下新开工作标签页时紫鸟窗口不会自动最小化；Bridge 每次调用约 0.4–3 秒，单个工具约 15–30 秒。排查慢可设 `TSM_TRACE=1`，每次调用 ziniao-cli 的耗时会打到 stderr。
 
 ## 配置
 
