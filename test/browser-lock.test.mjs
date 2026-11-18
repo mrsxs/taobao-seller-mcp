@@ -5,10 +5,10 @@ import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { lockPort, whoHolds, withBrowserLock } from '../lib/browser-lock.mjs';
 
-const LOCK = fileURLToPath(new URL('../lib/browser-lock.mjs', import.meta.url));
+// 子进程里 import 要用 file:// 地址（Windows 上 D:\... 这种路径 ESM 不认）
+const LOCK = new URL('../lib/browser-lock.mjs', import.meta.url).href;
 // 每个测试用自己的数据目录（锁端口由目录算出来）
 const made = [];
 const dirFor = (name) => {
@@ -56,7 +56,7 @@ test('锁：另一个进程持有时等待超时并说明是谁；那个进程�
       child.once('exit', (code) => { clearTimeout(t); bad(new Error(`子进程提前退出 ${code}`)); });
     });
     const { realpathSync } = await import('node:fs');
-    assert.deepEqual(await whoHolds(lockPort(realpathSync(dir))), { kind: 'ours', pid: child.pid, owner: '网页服务' });
+    assert.deepEqual(await whoHolds(lockPort(realpathSync.native(dir))), { kind: 'ours', pid: child.pid, owner: '网页服务' });
     await assert.rejects(withBrowserLock(dir, async () => 'x', { waitMs: 800 }), new RegExp(`正被另一个任务使用（网页服务，进程 ${child.pid}）`));
     child.kill('SIGKILL');
     await new Promise((r) => child.on('exit', r));
@@ -71,7 +71,7 @@ test('锁：端口被别的程序占着时说清楚', async () => {
   const { mkdirSync, realpathSync } = await import('node:fs');
   mkdirSync(dir, { recursive: true });
   const other = net.createServer((s) => s.end('hello'));
-  await new Promise((r) => other.listen(lockPort(realpathSync(dir)), '127.0.0.1', r));
+  await new Promise((r) => other.listen(lockPort(realpathSync.native(dir)), '127.0.0.1', r));
   try {
     await assert.rejects(withBrowserLock(dir, async () => 'x', { waitMs: 500 }), /被别的程序占用了/);
   } finally {
