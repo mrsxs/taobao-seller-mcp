@@ -1,6 +1,6 @@
 {
   "name": "taobao-seller-mcp",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Taobao / Tmall seller MCP server: 生意参谋 store analytics, traffic sources, product ranking and analysis, search words, promotion spend, free market insights (category ranks, price bands with average selling price, attributes), competitor shop comparison and buyer loss, plus Qianniu orders and products — read through the seller's own logged-in Ziniao (紫鸟) store browser, no Open Platform app key needed.",
   "keywords": ["mcp", "model-context-protocol", "taobao", "tmall", "qianniu", "sycm", "ziniao", "accio"],
   "homepage": "https://github.com/mrsxs/taobao-seller-mcp#readme",
