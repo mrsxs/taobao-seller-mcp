@@ -19,7 +19,7 @@ function fakePage() {
 
 test('evaluate：起任务再读回结果，支持 Promise，读完就删掉', async () => {
   const p = fakePage();
-  const page = connectCliPage('123456', 'T1', { exec: p.exec, sleep: () => Promise.resolve() });
+  const page = connectCliPage('123456', 'T1', { platform: 'linux', exec: p.exec, sleep: () => Promise.resolve() });
   assert.deepEqual(await page.evaluate('Promise.resolve({ a: 1, b: [2, 3] })'), { a: 1, b: [2, 3] });
   assert.equal(await page.evaluate('undefined'), null);
   assert.equal(await page.callInPage((x) => x.n * 2, { n: 21 }), 42);
@@ -28,24 +28,24 @@ test('evaluate：起任务再读回结果，支持 Promise，读完就删掉', a
 
 test('evaluate：页面里抛错 / 起不来 / 超时都报错', async () => {
   const p = fakePage();
-  const page = connectCliPage('123456', 'T1', { exec: p.exec, sleep: () => Promise.resolve() });
+  const page = connectCliPage('123456', 'T1', { platform: 'linux', exec: p.exec, sleep: () => Promise.resolve() });
   await assert.rejects(page.evaluate('Promise.reject(new Error("boom"))'), /页面脚本异常: .*boom/);
-  const broken = connectCliPage('123456', 'T1', { exec: async () => ({ exceptionDetails: { text: 'SyntaxError' } }) });
+  const broken = connectCliPage('123456', 'T1', { platform: 'linux', exec: async () => ({ exceptionDetails: { text: 'SyntaxError' } }) });
   await assert.rejects(broken.evaluate('1'), /页面脚本异常: SyntaxError/);
-  const navigating = connectCliPage('123456', 'T1', { exec: async () => ({ result: undefined }) });
+  const navigating = connectCliPage('123456', 'T1', { platform: 'linux', exec: async () => ({ result: undefined }) });
   await assert.rejects(navigating.evaluate('1'), /没有启动/);
-  const never = connectCliPage('123456', 'T1', { exec: async (s) => ({ result: s.includes("'started'") ? 'started' : null }), sleep: () => new Promise((r) => setTimeout(r, 5)) });
+  const never = connectCliPage('123456', 'T1', { platform: 'linux', exec: async (s) => ({ result: s.includes("'started'") ? 'started' : null }), sleep: () => new Promise((r) => setTimeout(r, 5)) });
   await assert.rejects(never.evaluate('1', 30), /超时/);
 });
 
 test('send：导航在页面里改 location，页面报错回 errorText；Network.enable 不用做；别的不支持', async () => {
   const p = fakePage();
   p.window.location = { href: 'about:blank' };
-  const page = connectCliPage('123456', 'T1', { exec: async (script) => ({ result: new Function('window', 'location', `return ${script}`)(p.window, p.window.location) }) });
+  const page = connectCliPage('123456', 'T1', { platform: 'linux', exec: async (script) => ({ result: new Function('window', 'location', `return ${script}`)(p.window, p.window.location) }) });
   assert.deepEqual(await page.send('Page.navigate', { url: 'https://sycm.taobao.com/x?a=1&b=2' }), {});
   assert.equal(p.window.location.href, 'https://sycm.taobao.com/x?a=1&b=2');
   assert.deepEqual(await page.send('Network.enable'), {});
-  const failing = connectCliPage('123456', 'T1', { exec: async () => ({ exceptionDetails: { text: 'blocked' } }) });
+  const failing = connectCliPage('123456', 'T1', { platform: 'linux', exec: async () => ({ exceptionDetails: { text: 'blocked' } }) });
   assert.deepEqual(await failing.send('Page.navigate', { url: 'u' }), { errorText: '页面脚本异常: blocked' });
   await assert.rejects(page.send('Target.createTarget'), /不支持/);
 });
