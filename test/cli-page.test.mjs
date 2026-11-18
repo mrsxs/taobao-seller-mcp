@@ -89,3 +89,18 @@ test('命令行模式等页面就绪：千牛不读 cookie，改看 mtop SDK', a
   await waitReady(cdp, QN_SITE);
   assert.ok(seen.length && seen.every((s) => !s.includes('document.cookie') && s.includes('lib.mtop')));
 });
+
+test('快路（非 Windows）：一次调用等 Promise 按值返回；页面异常照常报；不轮询', async () => {
+  const calls = [];
+  const awaitExec = async (script) => {
+    calls.push(script);
+    if (script.includes('throw')) return { exceptionDetails: { exception: { description: 'Error: boom' } } };
+    return { result: await (0, eval)(script) };
+  };
+  const page = connectCliPage('123456', 'T1', { platform: 'darwin', awaitExec, exec: async () => { throw new Error('不该走轮询'); } });
+  assert.deepEqual(await page.evaluate('Promise.resolve({ a: 1 })'), { a: 1 });
+  assert.equal(await page.evaluateSync('1 + 1'), 2);
+  assert.equal(await page.evaluate('undefined'), null);
+  await assert.rejects(page.evaluate('(() => { throw new Error("boom"); })()'), /页面脚本异常: Error: boom/);
+  assert.equal(calls.length, 4);
+});
