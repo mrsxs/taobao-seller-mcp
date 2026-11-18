@@ -122,3 +122,25 @@ test('生意参谋批量请求：一次往返按顺序发，解析时遇到验�
   const risky = createSycmApi({}, { token: 'T' }, null, async () => [ok({}), { status: 200, url: 'x', text: '<html>_____tmd_____/punish</html>' }]);
   await assert.rejects(risky.many([['/a', {}], ['/b', {}], ['/c', {}]]), /安全验证/);
 });
+
+test('批量请求的 optional：普通错误给 null，安全验证照样报错；竞店对比一次发完', async () => {
+  const { createSycmApi } = await import('../lib/sycm.mjs');
+  const { shopCompare } = await import('../lib/rival.mjs');
+  const ok = (data) => ({ status: 200, url: 'u', text: JSON.stringify({ code: 0, data }) });
+  const bad = { status: 200, url: 'u', text: JSON.stringify({ code: 1, message: '没有数据' }) };
+  const g1 = createSycmApi({}, { token: 'T' }, null, async () => [ok(1), bad]);
+  assert.deepEqual(await g1.many([['/a', {}], ['/b', {}]], { optional: [1] }), [1, null]);
+  await assert.rejects(g1.many([['/a', {}], ['/b', {}]]), /生意参谋/);
+  const g2 = createSycmApi({}, { token: 'T' }, null, async () => [ok(1), { status: 200, url: 'x', text: 'punish x5sec' }]);
+  await assert.rejects(g2.many([['/a', {}], ['/b', {}]], { optional: [1] }), /安全验证/);
+  const sent = [];
+  const g3 = createSycmApi({}, { token: 'T' }, async () => { throw new Error('不该单发'); }, async (_c, reqs) => {
+    sent.push(reqs.map((r) => new URL(r.url).pathname));
+    return reqs.map((r, i) => (i === reqs.length - 1 ? bad : ok({})));
+  });
+  const out = await shopCompare(g3, { start: '2026-11-11', end: '2026-11-17' }, [{ userId: 1, name: 'A' }, { userId: 2, name: 'B' }]);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].length, 6);
+  assert.equal(out.rivals.length, 2);
+  assert.equal(out.rivals[1].news, null);
+});
