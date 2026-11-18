@@ -104,3 +104,21 @@ test('快路（非 Windows）：一次调用等 Promise 按值返回；页面异
   await assert.rejects(page.evaluate('(() => { throw new Error("boom"); })()'), /页面脚本异常: Error: boom/);
   assert.equal(calls.length, 4);
 });
+
+test('生意参谋批量请求：一次往返按顺序发，解析时遇到验证就报错；单品分析一次发完', async () => {
+  const { createSycmApi, productAnalysis } = await import('../lib/sycm.mjs');
+  const ok = (data) => ({ status: 200, url: 'u', text: JSON.stringify({ code: 0, data }) });
+  const sent = [];
+  const requestMany = async (_cdp, reqs) => {
+    sent.push(reqs.map((r) => new URL(r.url).pathname));
+    return reqs.map((r) => ok({ path: new URL(r.url).pathname, token: new URL(r.url).searchParams.get('token') }));
+  };
+  const get = createSycmApi({}, { token: 'T' }, async () => { throw new Error('不该单发'); }, requestMany);
+  const out = await productAnalysis(get, { start: '2026-11-11', end: '2026-11-17' }, '123', { sections: ['overview', 'skus', 'sources'] });
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0], ['/cc/item/sale/overview.json', '/cc/item/sale/sku/list.json', '/flow/item/source/tree/support.json']);
+  assert.ok('overview' in out && 'skus' in out && 'sources' in out);
+  // 页面在验证页后停了：第二个返回验证页，第三个没发 → 解析到第二个就抛错
+  const risky = createSycmApi({}, { token: 'T' }, null, async () => [ok({}), { status: 200, url: 'x', text: '<html>_____tmd_____/punish</html>' }]);
+  await assert.rejects(risky.many([['/a', {}], ['/b', {}], ['/c', {}]]), /安全验证/);
+});
